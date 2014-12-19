@@ -73,6 +73,7 @@ WatchFile *leading_edge;
 int restart_opt;
 int clear_opt;
 int dirwatch_opt;
+int exit_opt;
 int child_pid;
 
 /* forwards */
@@ -127,6 +128,7 @@ main(int argc, char *argv[]) {
 	/* normally a user will exit this utility by do_execting Ctrl-C */
 	act.sa_flags = 0;
 	act.sa_handler = handle_exit;
+        /* & - typo? will only fail if emptyset AND action failed */
 	if (sigemptyset(&act.sa_mask) & (sigaction(SIGINT, &act, NULL) != 0))
 		err(1, "Failed to set SIGINT handler");
 	if (sigemptyset(&act.sa_mask) & (sigaction(SIGTERM, &act, NULL) != 0))
@@ -180,11 +182,21 @@ main(int argc, char *argv[]) {
 void
 usage() {
 	extern char *__progname;
-	fprintf(stderr, "usage: %s [-dr] [-c] utility [args, [/_], ...] < filenames\n",
+	fprintf(stderr, "usage: %s [-drv] [-c] utility [args, [/_], ...] < filenames\n",
 	    __progname);
 	fprintf(stderr, "       %s +fifo < filenames\n",
 	    __progname);
 	exit(1);
+}
+
+void
+report_exit(pid_t pid, int status) {
+    if (!exit_opt)
+        return;
+    if(WIFEXITED(status))
+        fprintf(stderr, "child %d exited with %d\n", pid, WEXITSTATUS(status));
+    if(WIFSIGNALED(status))
+        fprintf(stderr, "child %d signalled with %d\n", pid, WTERMSIG(status));
 }
 
 void
@@ -197,7 +209,8 @@ terminate_utility() {
 		    child_pid);
 		#endif
 		xkill(child_pid, SIGTERM);
-		xwaitpid(child_pid, &status, 0);
+		if(xwaitpid(child_pid, &status, 0) > 0)
+                    report_exit(child_pid, status);
 		child_pid = 0;
 	}
 }
@@ -222,6 +235,7 @@ handle_exit(int sig) {
  */
 int
 process_input(FILE *file, WatchFile *files[], int max_files) {
+        // I thought PATH_MAX didn't include NUL?
 	char buf[PATH_MAX];
 	char *p, *path;
 	int n_files = 0;
@@ -313,7 +327,7 @@ set_options(char *argv[]) {
 
 	/* read arguments until we reach a command */
 	for (argc=1; argv[argc] != 0 && argv[argc][0] == '-'; argc++);
-	while ((ch = getopt(argc, argv, "cdr")) != -1) {
+	while ((ch = getopt(argc, argv, "cdrx")) != -1) {
 		switch (ch) {
 		case 'c':
 			clear_opt = 1;
@@ -324,12 +338,15 @@ set_options(char *argv[]) {
 		case 'r':
 			restart_opt = 1;
 			break;
+		case 'x':
+			exit_opt = 1;
+			break;
 		default:
 			usage();
 		}
 	}
 	/* no command to run */
-	if (argv[optind] == '\0')
+	if (argv[optind] == 0)
 		usage();
 	return optind;
 }
@@ -387,8 +404,9 @@ run_utility(char *argv[]) {
 	}
 	child_pid = pid;
 
-	if (restart_opt == 0)
+	if (restart_opt == 0) {
 		xwaitpid(pid, &status, 0);
+        }
 
 	xfree(arg_buf);
 	xfree(new_argv);
@@ -416,6 +434,9 @@ watch_file(int kq, WatchFile *file) {
 	if (file->fd == -1)
 		err(1, "cannot open `%s'", file->fn);
 
+#ifdef DEBUG
+        fprintf(stderr, "watch file `%s`\n", file->fn);
+#endif
 	EV_SET(&evSet, file->fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_ALL, 0,
 	    file);
 	if (xkevent(kq, &evSet, 1, NULL, 0, NULL) == -1)
@@ -457,6 +478,8 @@ void
 watch_loop(int kq, char *argv[]) {
 	struct kevent evSet;
 	struct kevent evList[32];
+        struct kevent changeList[1];
+        int nchange = 0;
 	int nev;
 	WatchFile *file;
 	int i;
@@ -467,14 +490,25 @@ watch_loop(int kq, char *argv[]) {
 	int dir_modified = 0;
 
 	leading_edge = files[0]; /* default */
-	if (restart_opt)
+	if (restart_opt) {
 		run_utility(argv);
+#if 0
+                EV_SET(&changeList[0],
+                  child_pid, /* ident */
+                  EVFILT_PROC,  /* filter */
+                  EV_ADD|EV_ONESHOT, /* flags */
+                  NOTE_EXIT|NOTE_EXITSTATUS, /* filter-specific flags */
+                  0, /* extra data */
+                  0); /* user data */
+                nchange = 1;
+#endif
+        }
 
 main:
 	if ((reopen_only == 1) || (collate_only == 1))
-		nev = xkevent(kq, NULL, 0, evList, 32, &evTimeout);
+		nev = xkevent(kq, changeList, nchange, evList, 32, &evTimeout);
 	else {
-		nev = xkevent(kq, NULL, 0, evList, 32, NULL);
+		nev = xkevent(kq, changeList, nchange, evList, 32, NULL);
 		dir_modified = 0;
 	}
 	/* escape for test runner */
