@@ -16,11 +16,14 @@
 #include <sys/inotify.h>
 #include <sys/event.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 
+#include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +70,11 @@ kqueue(void) {
 	return inotify_init();
 }
 
+static void
+handle_sigchld() {
+	/* Interrupt ppoll */
+}
+
 /*
  * Emulate kqueue(2). Only monitors STDIN for EVFILT_READ and only the
  * EVFILT_VNODE flags used in entr.c are considered. Returns the number of
@@ -85,8 +93,15 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 	u_int fflags;
 	const struct kevent *kev;
 	int ignored;
+	sigset_t sigmask;
 	struct pollfd *pfd;
 	int nfds;
+	struct timespec polldelay = {
+	    .tv_sec = 0, .tv_nsec = 50 /* ms */ * 1000000
+	};
+
+	if (sigprocmask(SIG_SETMASK, NULL, &sigmask) || sigdelset(&sigmask, SIGCHLD))
+	    err(1, "failed to build sigmask");
 
 	pfd = calloc(2, sizeof(struct pollfd));
 	pfd[0].fd = kq;
@@ -94,10 +109,30 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 	pfd[1].fd = STDIN_FILENO;
 	pfd[1].events = POLLIN;
 
+	/* BSD kevent() allows changes to be applied and to wait for events in a
+	 * single call, but entr doesn't need this, so do one or the other.
+	 */
 	if (nchanges > 0) {
 		ignored = 0;
 		for (n=0; n<nchanges; n++) {
 			kev = changelist + (sizeof(struct kevent)*n);
+
+			if (kev->filter == EVFILT_PROC) {
+				struct sigaction act;
+				sigset_t sset;
+				assert(kev->flags == (EV_ADD|EV_ONESHOT));
+				assert(kev->fflags == (NOTE_EXIT|NOTE_EXITSTATUS));
+				if (sigprocmask(SIG_SETMASK, NULL, &sset) ||
+					    sigaddset(&sset, SIGCHLD) ||
+					    sigprocmask(SIG_SETMASK, &sset, NULL))
+					err(1, "failed to mask SIGCHILD");
+				act.sa_flags = 0;
+				act.sa_handler = handle_sigchld;
+				if (sigemptyset(&act.sa_mask) || sigaction(SIGCHLD, &act, NULL))
+					err(1, "failed to set CHILD handler");
+				continue;
+			}
+
 			file = (WatchFile *)kev->udata;
 
 			if (kev->filter == EVFILT_READ) {
@@ -125,17 +160,23 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 			else
 				ignored++;
 		}
-		return nchanges - ignored;
+		return 0;
 	}
 
 	if (read_stdin == 1)
 		nfds = 2; /* inotify and stdin */
 	else
 		nfds = 1; /* inotify */
+
+        int pret;
 	if (timeout == NULL)
-		poll(pfd, nfds, -1);
+		pret = ppoll(pfd, nfds, NULL, &sigmask);
 	else
-		poll(pfd, nfds, timeout->tv_nsec/1000000);
+		pret = ppoll(pfd, nfds, timeout, &sigmask);
+
+        if (pret == 0) {
+                return 0;
+        }
 
 	n = 0;
 	do {
@@ -176,6 +217,18 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 				eventlist[n].udata = file_by_descriptor(iev->wd);
 				if (eventlist[n].udata)
 					n++;
+
+                                int status;
+                                pid_t pid;
+                                if ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                                        eventlist[n].ident = pid;
+                                        eventlist[n].filter = EVFILT_PROC;
+                                        eventlist[n].flags = 0;
+                                        eventlist[n].fflags = NOTE_EXIT|NOTE_EXITSTATUS;
+                                        eventlist[n].data = status;
+                                        eventlist[n].udata = NULL;
+                                        n++;
+                                }
 			}
 		}
 		if (read_stdin == 1) {
@@ -194,8 +247,8 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 			}
 		}
 	}
-	while ((poll(pfd, nfds, 50) > 0));
-	
+	while ((ppoll(pfd, nfds, &polldelay, &sigmask) > 0));
+
 	(void) free(pfd);
 	return n;
 }

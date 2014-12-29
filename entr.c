@@ -81,6 +81,8 @@ int postpone_opt;
 int restart_opt;
 int shell_opt;
 struct termios canonical_tty;
+int exit_opt;
+int child_pid;
 
 /* forwards */
 
@@ -90,7 +92,7 @@ static void handle_exit(int sig);
 static int process_input(FILE *, WatchFile *[], int);
 static int set_options(char *[]);
 static int list_dir(char *);
-static void run_utility(char *[]);
+static void run_utility(int kq, char *[]);
 static void watch_file(int, WatchFile *);
 static int compare_dir_contents(WatchFile *);
 static void watch_loop(int, char *[]);
@@ -204,8 +206,30 @@ main(int argc, char *argv[]) {
 void
 usage() {
 	fprintf(stderr, "release: %s\n", RELEASE);
-	fprintf(stderr, "usage: entr [-acdnprs] utility [argument [/_] ...] < filenames\n");
+	fprintf(stderr, "usage: entr [-acdnprsx] utility [argument [/_] ...] < filenames\n");
 	exit(1);
+}
+
+void report_child(pid_t pid, int status) {
+    if (pid == child_pid)
+        child_pid = 0;
+    if (!exit_opt)
+        return;
+    if(WIFEXITED(status))
+        fprintf(stderr, "** child %d exited with %d\n", pid, WEXITSTATUS(status));
+    if(WIFSIGNALED(status))
+        fprintf(stderr, "** child %d signalled with %d\n", pid, WTERMSIG(status));
+}
+
+void
+wait_child() {
+    pid_t pid = child_pid;
+    int status;
+    if (!pid)
+        return;
+    if (xwaitpid(pid, &status, 0) < 0)
+        return;
+    report_child(pid, status);
 }
 
 void
@@ -214,7 +238,7 @@ terminate_utility() {
 
 	if (child_pid > 0) {
 		xkillpg(child_pid, SIGTERM);
-		xwaitpid(child_pid, &status, 0);
+		wait_child();
 		child_pid = 0;
 	}
 }
@@ -225,6 +249,8 @@ void
 handle_exit(int sig) {
 	if (!noninteractive_opt)
 		xtcsetattr(0, TCSADRAIN, &canonical_tty);
+        /* Disable status report, no stdio is allowed in sig handlers */
+        exit_opt = 0;
 	terminate_utility();
 	raise(sig);
 }
@@ -312,7 +338,7 @@ set_options(char *argv[]) {
 
 	/* read arguments until we reach a command */
 	for (argc=1; argv[argc] != 0 && argv[argc][0] == '-'; argc++);
-	while ((ch = getopt(argc, argv, "acdnprs")) != -1) {
+	while ((ch = getopt(argc, argv, "acdnprsx")) != -1) {
 		switch (ch) {
 		case 'a':
 			aggressive_opt = 1;
@@ -334,6 +360,8 @@ set_options(char *argv[]) {
 			break;
 		case 's':
 			shell_opt = 1;
+		case 'x':
+			exit_opt = 1;
 			break;
 		default:
 			usage();
@@ -351,7 +379,7 @@ set_options(char *argv[]) {
  * then send the child process SIGTERM and restart it.
  */
 void
-run_utility(char *argv[]) {
+run_utility(int kq, char *argv[]) {
 	int pid;
 	int i, m;
 	int ret, status;
@@ -398,6 +426,13 @@ run_utility(char *argv[]) {
 		err(1, "can't fork");
 
 	if (pid == 0) {
+		/* unmask SIGCHLD, so mask isn't inherited */
+		sigset_t sset;
+		if (sigprocmask(SIG_SETMASK, NULL, &sset) ||
+				sigdelset(&sset, SIGCHLD) ||
+				sigprocmask(SIG_SETMASK, &sset, NULL))
+			err(1, "failed to unmask SIGCHILD");
+
 		if (clear_opt == 1)
 			(void) system("/usr/bin/clear");
 		/* Set process group so subprocess can be signaled */
@@ -417,10 +452,21 @@ run_utility(char *argv[]) {
 	child_pid = pid;
 
 	if (restart_opt == 0) {
-		xwaitpid(pid, &status, 0);
+		wait_child();
 		if (shell_opt == 1)
 			fprintf(stdout, "%s returned exit code %d\n",
 			    basename(getenv("SHELL")), WEXITSTATUS(status));
+        } else {
+		struct kevent ev;
+		EV_SET(&ev,
+		    child_pid, /* ident */
+		    EVFILT_PROC,  /* filter */
+		    EV_ADD|EV_ONESHOT, /* flags */
+		    NOTE_EXIT|NOTE_EXITSTATUS, /* filter-specific flags */
+		    0, /* extra data */
+		    0); /* user data */
+		if (xkevent(kq, &ev, 1, NULL, 0, NULL) == -1)
+			err(1, "failed to add PROC event");
 	}
 
 	xfree(arg_buf);
@@ -514,7 +560,9 @@ watch_loop(int kq, char *argv[]) {
 
 	leading_edge = files[0]; /* default */
 	if (postpone_opt == 0)
-		run_utility(argv);
+		run_utility(kq, argv);
+	if (restart_opt)
+		run_utility(kq, argv);
 
 	if (!noninteractive_opt) {
 		/* disabling/restore line buffering and local echo */
@@ -555,6 +603,20 @@ main:
 					kill(getpid(), SIGINT);
 			}
 		}
+
+		#ifdef DEBUG
+		fprintf(stderr, "event %d/%d: ident %d filter %d flags 0x%x "
+		    "fflags 0x%x udata %d udata %p\n", i+1,
+		    nev,
+		    evList[i].ident,
+		    evList[i].filter,
+		    evList[i].flags,
+		    evList[i].fflags,
+		    evList[i].data,
+		    evList[i].udata);
+		#endif
+                if (evList[i].filter == EVFILT_PROC)
+                    report_child(evList[i].ident, evList[i].data);
 		if (evList[i].filter != EVFILT_VNODE)
 			continue;
 
@@ -638,7 +700,7 @@ main:
 		goto main;
 	if (do_exec == 1) {
 		do_exec = 0;
-		run_utility(argv);
+		run_utility(kq, argv);
 		if (!aggressive_opt)
 			reopen_only = 1;
 		leading_edge_set = 0;
