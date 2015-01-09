@@ -146,7 +146,6 @@ kevent(int kq, const struct kevent *changelist, int nchanges, struct
 	n = 0;
 	do {
 		if (((pret = ppoll(&pfd, 1, timeout, &sigmask)) == 0)) {
-			fprintf(stderr,"ppoll timed out, return\n");
 			return 0;
 		}
 
