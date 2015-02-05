@@ -313,7 +313,7 @@ set_options(char *argv[]) {
 
 	/* read arguments until we reach a command */
 	for (argc=1; argv[argc] != 0 && argv[argc][0] == '-'; argc++);
-	while ((ch = getopt(argc, argv, "cdr")) != -1) {
+	while ((ch = getopt(argc, argv, "cdrx")) != -1) {
 		switch (ch) {
 		case 'c':
 			clear_opt = 1;
@@ -323,6 +323,8 @@ set_options(char *argv[]) {
 			break;
 		case 'r':
 			restart_opt = 1;
+			break;
+		case 'x':
 			break;
 		default:
 			usage();
