@@ -220,7 +220,7 @@ terminate_utility() {
 		    child_pid);
 		#endif
 		xkill(child_pid, SIGTERM);
-		wait_child(child_pid);
+		wait_child();
 		child_pid = 0;
 	}
 }
