@@ -356,7 +356,7 @@ set_options(char *argv[]) {
 		}
 	}
 	/* no command to run */
-	if (argv[optind] == '\0')
+	if (argv[optind] == NULL)
 		usage();
 	return optind;
 }
