@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 
 #include <assert.h>
+#include <err.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
