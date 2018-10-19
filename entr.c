@@ -398,6 +398,13 @@ run_utility(char *argv[]) {
 		err(1, "can't fork");
 
 	if (pid == 0) {
+		/* unmask SIGCHLD, so mask isn't inherited */
+		sigset_t sset;
+		if (sigprocmask(SIG_SETMASK, NULL, &sset) ||
+				sigdelset(&sset, SIGCHLD) ||
+				sigprocmask(SIG_SETMASK, &sset, NULL))
+			err(1, "failed to mask SIGCHILD");
+
 		if (clear_opt == 1)
 			(void) system("/usr/bin/clear");
 		/* Set process group so subprocess can be signaled */
